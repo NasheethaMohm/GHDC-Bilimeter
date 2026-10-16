@@ -2,12 +2,20 @@
 """
 Button listener with LCD status display.
 Raspberry Pi Zero 2 W
-- Button on GPIO17 starts/stops sensor.py
-- 16x2 I2C LCD shows current status
+- Button on GPIO17 starts/stops BiliMeter_Test_revised.py
+- 16x2 I2C LCD shows current status and the final result
+
+LCD ownership:
+- While the measurement script runs, it owns the LCD; this listener
+  does not write to the screen.
+- After it exits, this listener shows the result (parsed from the
+  script's "RESULT <value>" output line) until the next press.
 """
 
 from gpiozero import Button
 from RPLCD.i2c import CharLCD
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -15,8 +23,14 @@ import sys
 
 # ── Configuration ─────────────────────────────────────────────────────
 BUTTON_PIN   = 17                    # GPIO17 = physical Pin 11
-SCRIPT_PATH  = "/home/pi/sensor.py" # full path to sensor script
+# Measurement script: same folder as this file, unless overridden
+SCRIPT_PATH  = os.environ.get(
+    "BILIMETER_SCRIPT",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "BiliMeter_Test_revised.py"),
+)
 DEBOUNCE     = 0.3                   # button debounce seconds
+STOP_TIMEOUT = 10                    # seconds to wait for clean shutdown
 LCD_ADDR     = 0x27                  # change to 0x3F if needed
 LCD_PORT     = 1
 LCD_COLS     = 16
@@ -52,6 +66,8 @@ class LCD:
             return
         with self._lock:
             try:
+                # Measurement script may have changed the backlight
+                self.screen.backlight_enabled = True
                 # Line 1
                 padded1 = line1[:LCD_COLS].ljust(LCD_COLS)
                 self.screen.cursor_pos = (0, 0)
@@ -91,9 +107,9 @@ class ButtonController:
     def __init__(self, lcd):
         self.lcd            = lcd
         self.script_process = None
+        self.result         = None
         self._lock          = threading.Lock()
-        self._dot_thread    = None
-        self._dot_running   = False
+        self._reader_thread = None
 
         # Setup button
         self.button = Button(
@@ -108,6 +124,21 @@ class ButtonController:
         return (self.script_process is not None and
                 self.script_process.poll() is None)
 
+    def _read_output(self, proc):
+        """
+        Echo the script's output (goes to the systemd journal) and
+        capture the final RESULT line. Reading continuously also keeps
+        the pipe from filling up and blocking the script.
+        """
+        for line in proc.stdout:
+            line = line.rstrip()
+            print(f"  [sensor] {line}")
+            if line.startswith("RESULT "):
+                try:
+                    self.result = float(line.split()[1])
+                except (IndexError, ValueError):
+                    pass
+
     def _start_script(self):
         """Start the sensor script."""
         with self._lock:
@@ -115,39 +146,44 @@ class ButtonController:
                 print("Already running — ignoring.")
                 return
 
-            print("Starting sensor script...")
+            print(f"Starting sensor script: {SCRIPT_PATH}")
             self.lcd.write(
                 "Starting...",
                 "Please wait"
             )
-            time.sleep(0.5)
+            self.result = None
 
             try:
                 self.script_process = subprocess.Popen(
-                    ["python3", SCRIPT_PATH],
+                    # Same Python as this listener, so systemd uses the
+                    # same environment/packages
+                    [sys.executable, SCRIPT_PATH],
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=dict(os.environ, PYTHONUNBUFFERED="1"),
                 )
                 print(f"Script started — PID {self.script_process.pid}")
-                self.lcd.write(
-                    "Sensor Running",
-                    "PID:" + str(self.script_process.pid)
+                self._reader_thread = threading.Thread(
+                    target=self._read_output,
+                    args=(self.script_process,),
+                    daemon=True,
                 )
-                time.sleep(1)
-                self.lcd.write(
-                    "Sensor Running",
-                    "Press to stop"
-                )
-
-                # Start dot animation to show it is alive
-                self._start_dot_animation()
+                self._reader_thread.start()
+                # From here the sensor script owns the LCD
 
             except Exception as e:
                 print(f"  [ERROR] Could not start script: {e}")
+                self.script_process = None
                 self.lcd.write(
                     "Start Failed!",
                     str(e)[:LCD_COLS]
                 )
+
+    def _wait_for_reader(self):
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2)
+            self._reader_thread = None
 
     def _stop_script(self):
         """Stop the sensor script."""
@@ -157,20 +193,20 @@ class ButtonController:
                 return
 
             print("Stopping sensor script...")
-            self._stop_dot_animation()
-            self.lcd.write(
-                "Stopping...",
-                "Please wait"
-            )
 
             try:
-                self.script_process.terminate()
-                self.script_process.wait(timeout=5)
+                # SIGINT = Ctrl+C, so the script's cleanup code runs
+                # (sensor shutdown, LCD release)
+                self.script_process.send_signal(signal.SIGINT)
+                self.script_process.wait(timeout=STOP_TIMEOUT)
             except subprocess.TimeoutExpired:
+                print("  [WARN] Script did not stop — killing it.")
                 self.script_process.kill()
+                self.script_process.wait()
             except Exception as e:
                 print(f"  [WARN] Stop error: {e}")
 
+            self._wait_for_reader()
             self.script_process = None
             print("Script stopped.")
             self.lcd.write(
@@ -178,49 +214,42 @@ class ButtonController:
                 "Press to start"
             )
 
+    def check_finished(self):
+        """Show the result if the script ended on its own."""
+        with self._lock:
+            if (self.script_process is None or
+                    self.script_process.poll() is None):
+                return
+
+            code = self.script_process.returncode
+            self._wait_for_reader()
+            self.script_process = None
+            print(f"Script ended on its own (exit code {code}).")
+
+            if self.result is not None:
+                print(f"Result: {self.result:.2f} mg/dL")
+                # e.g. "Bili  12.3 mg/dL" (16 chars)
+                self.lcd.write(
+                    f"Bili {self.result:5.1f} mg/dL",
+                    "Press to start"
+                )
+            elif code != 0:
+                self.lcd.write(
+                    "Measure failed",
+                    "Press to retry"
+                )
+            else:
+                self.lcd.write(
+                    "Script Ended",
+                    "Press to start"
+                )
+
     def _on_press(self):
         """Called every time button is pressed."""
         if self._is_running():
             self._stop_script()
         else:
             self._start_script()
-
-    # ── Dot animation ─────────────────────────────────────────────────
-    # Shows dots cycling on line 2 to show the script is still running
-    # Line 2 cycles through:
-    # "Running .      "
-    # "Running ..     "
-    # "Running ...    "
-    # "Running .      " (loops)
-
-    def _start_dot_animation(self):
-        self._dot_running = True
-        self._dot_thread  = threading.Thread(
-            target=self._dot_loop, daemon=True
-        )
-        self._dot_thread.start()
-
-    def _stop_dot_animation(self):
-        self._dot_running = False
-        if self._dot_thread:
-            self._dot_thread.join(timeout=2)
-            self._dot_thread = None
-
-    def _dot_loop(self):
-        dots = 0
-        while self._dot_running:
-            dots = (dots % 3) + 1
-            dot_str = "Running " + "." * dots
-            # Only update line 2, keep line 1 as is
-            if self.lcd.available:
-                try:
-                    with self.lcd._lock:
-                        padded = dot_str[:LCD_COLS].ljust(LCD_COLS)
-                        self.lcd.screen.cursor_pos = (1, 0)
-                        self.lcd.screen.write_string(padded)
-                except Exception:
-                    pass
-            time.sleep(0.6)
 
     def show_ready(self):
         """Show ready message on LCD at startup."""
@@ -231,24 +260,35 @@ class ButtonController:
 
     def close(self):
         """Clean shutdown."""
-        self._stop_dot_animation()
         if self._is_running():
             self._stop_script()
         self.lcd.close()
 
 
 # ── Main ──────────────────────────────────────────────────────────────
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
+    # systemd stops services with SIGTERM; handle it like Ctrl+C so the
+    # measurement script and LCD are shut down cleanly
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
     print("=== Button Listener with LCD ===")
     print(f"  Button  : GPIO{BUTTON_PIN} (Pin 11)")
     print(f"  Script  : {SCRIPT_PATH}")
+    print(f"  Python  : {sys.executable}")
     print(f"  LCD     : 0x{LCD_ADDR:02X} on bus {LCD_PORT}\n")
+
+    if not os.path.isfile(SCRIPT_PATH):
+        print(f"  [WARN] Script not found: {SCRIPT_PATH}")
 
     # Initialise LCD
     lcd = LCD(addr=LCD_ADDR, port=LCD_PORT)
 
     lcd.write(
-        " Heart Rate 10",
+        "   Bilimeter",
         "  Initialising"
     )
     time.sleep(1)
@@ -262,16 +302,7 @@ def main():
 
     try:
         while True:
-            # Check if script ended on its own
-            if (controller.script_process is not None and
-                    controller.script_process.poll() is not None):
-                print("Script ended on its own — resetting.")
-                controller._stop_dot_animation()
-                controller.script_process = None
-                lcd.write(
-                    "Script Ended",
-                    "Press to start"
-                )
+            controller.check_finished()
             time.sleep(0.5)
 
     except KeyboardInterrupt:

@@ -7,6 +7,7 @@ Calculates absorbance using Beer-Lambert law
 """
 import sys
 import time
+import signal
 import threading
 from collections import deque
 
@@ -43,7 +44,11 @@ LED_IR    = 0x1
 LED_RED   = 0x2
 LED_GREEN = 0x3
 LED_BLUE  = 0x4
- 
+
+# ── Calibration (PLACEHOLDER until fitted to reference data) ──────────
+CAL_D      = 1.0   # scale (mg/dL per absorbance unit)
+CAL_ALPHA  = 1.0   # green weighting (corrects for melanin / hemoglobin)
+CAL_OFFSET = 0.0   # mg/dL
 
 class MAX86916:
     def __init__(self, bus_num=I2C_BUS):
@@ -195,7 +200,12 @@ class MAX86916:
         self._write(REG_MODE_CFG1, 0x80)
 
     def close(self):
-        self.shutdown()
+        # Don't let a failed shutdown (e.g. sensor unplugged) raise a
+        # second error that hides the original one
+        try:
+            self.shutdown()
+        except OSError as e:
+            print(f"  [WARN] Sensor shutdown failed: {e}")
         self.bus.close()
 
 
@@ -273,7 +283,7 @@ class LCDDisplay:
                 backlight_enabled=True,
             )
             self.lcd.clear()
-            self._write_line(0, "  Heart Rate 10 ")
+            self._write_line(0, "   Bilimeter    ")
             self._write_line(1, "  Initialising..")
             print(f"  LCD initialised at 0x{addr:02X} ✓")
         except Exception as e:
@@ -360,60 +370,78 @@ class LCDDisplay:
             self._write_line(0, line1)
             self._write_line(1, line2)
 
-    def close(self):
-        """Stop thread and clear LCD."""
+    def stop(self):
+        """Stop background refresh thread (leaves the screen as is)."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)
+            self._thread = None
+
+    def close(self):
+        """
+        Stop thread and release the LCD without clearing it.
+        Screen and backlight stay on so the final result remains
+        visible; button_listener.py takes over the display after exit.
+        """
+        self.stop()
         if self.lcd:
             try:
-                self.lcd.clear()
-                self._write_line(0, "   Stopped.     ")
-                self._write_line(1, "                ")
-                time.sleep(1)
-                self.lcd.backlight_enabled = False
-                self.lcd.close()
+                self.lcd.close(clear=False)
             except Exception:
                 pass
 
 
 # ── Main ──────────────────────────────────────────────────────────────
+N_SKIP = 4    # first concentration readings to discard while buffers fill
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
+    # Treat SIGTERM (systemd stop / listener fallback) like Ctrl+C so the
+    # finally block always shuts the sensor down
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
     sensor = MAX86916(bus_num=1)
-    
+
     lcd = LCDDisplay(addr=0x27)
-    
-    sensor.setup(
-        ir_ma=10.0,
-        red_ma=10.0,
-        green_ma=10.0,
-        blue_ma=10.0,
-        sample_rate=1,    # 100 sps
-        pulse_width=1,    # 120 µs
-        adc_range=2,      # 16 µA full scale
-    )
-    
-    lcd.show_message("Collecting", "baseline...")
-
-    baseline = collect_baseline(sensor, n=150)
-    sensor.clear_fifo()
-    
-    print("Calibration complete! Measurement in 5 seconds...\n");
-    lcd.show_message("Place finger", "on sensor...")
-    time.sleep(5)
-    
-    lcd.start()
-
-    print("Place finger on sensor. Press Ctrl+C to stop.\n")
-    print(f"{'IR':>10} {'RED':>10} {'GREEN':>10} {'BLUE':>10} "
-          f"{'Abs_IR':>8} {'Abs_RED':>8} {'Abs_GRN':>8} {'Abs_BLU':>8}"
-          f" {'Conc' :>10}")
-    print("-" * 95)
-
-    # Rolling buffers for smoothing
-    buf = {k: deque(maxlen=50) for k in ('ir', 'red', 'green', 'blue')}
 
     try:
+        sensor.setup(
+            ir_ma=10.0,
+            red_ma=10.0,
+            green_ma=10.0,
+            blue_ma=10.0,
+            sample_rate=1,    # 100 sps
+            pulse_width=1,    # 120 µs
+            adc_range=2,      # 16 µA full scale
+        )
+
+        lcd.show_message("Collecting", "baseline...")
+
+        baseline = collect_baseline(sensor, n=150)
+        sensor.clear_fifo()
+
+        print("Calibration complete! Measurement in 5 seconds...\n")
+        lcd.show_message("Place finger", "on sensor...")
+        time.sleep(5)
+        # FIFO filled and stopped during the wait; drop those samples
+        # (taken before the finger was placed)
+        sensor.clear_fifo()
+
+        lcd.start()
+
+        print("Place finger on sensor. Press Ctrl+C to stop.\n")
+        print(f"{'IR':>10} {'RED':>10} {'GREEN':>10} {'BLUE':>10} "
+              f"{'Abs_IR':>8} {'Abs_RED':>8} {'Abs_GRN':>8} {'Abs_BLU':>8}"
+              f" {'Conc' :>10}")
+        print("-" * 95)
+
+        # Rolling buffers for smoothing
+        buf = {k: deque(maxlen=50) for k in ('ir', 'red', 'green', 'blue')}
+
         t = 0
         Conc = []
         while t < 100:
@@ -433,7 +461,10 @@ def main():
                     abs_['green'],
                     abs_['blue'],
                 )
-                
+
+                # Baseline-normalised form of C = D*log10(E * G^alpha / B)
+                bili_index = abs_['blue'] - CAL_ALPHA * abs_['green']
+
                 print(
                     f"{mean['ir']:>10.2f} "
                     f"{mean['red']:>10.2f} "
@@ -442,21 +473,36 @@ def main():
                     f"{abs_['ir']:>8.4f} "
                     f"{abs_['red']:>8.4f} "
                     f"{abs_['green']:>8.4f} "
-                    f"{abs_['blue']:>8.4f}"
-                    f"{np.log10(mean['green']/mean['blue']):>8.4f}"
+                    f"{abs_['blue']:>8.4f} "
+                    f"{bili_index:>10.4f}"
                 )
                 
-                Conc.append(np.log10(mean['green']/mean['blue']))
+                Conc.append(bili_index)
             
 
             time.sleep(0.1)
             t += 1
             
-        print("Conc Average:" + f"{(2*(sum(Conc[4:])/(len(Conc) - 4))):>8.4f}" + " mg/dL")
-        lcd.show_message("Concentration: " + str(sum(Conc[4:])/(len(Conc)-4)))
+        lcd.stop()    # stop absorbance refresh so it can't overwrite the result
+
+        if len(Conc) <= N_SKIP:
+            print("Not enough readings to estimate concentration.")
+            lcd.show_message("Too few readings", "Try again")
+            sys.exit(1)
+
+        # C = D * (A_blue - alpha * A_green) + offset
+        # CAL_* constants are PLACEHOLDERS until fitted to reference data,
+        # so this is not a real mg/dL value yet.
+        conc = CAL_D * sum(Conc[N_SKIP:]) / (len(Conc) - N_SKIP) + CAL_OFFSET
+        print("Conc Average:" + f"{conc:>8.4f}" + " mg/dL")
+        # Machine-readable line parsed by button_listener.py
+        print(f"RESULT {conc:.4f}", flush=True)
+        lcd.show_message("Est. bilirubin:", f"{conc:.2f} mg/dL")
 
     except KeyboardInterrupt:
         print("\nStopped.")
+        lcd.stop()
+        lcd.show_message("Stopped.")
     finally:
         lcd.close()
         sensor.close()
