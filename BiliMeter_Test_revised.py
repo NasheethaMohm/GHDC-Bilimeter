@@ -6,13 +6,13 @@ All 4 LEDs: IR, Red, Green, Blue
 Calculates absorbance using Beer-Lambert law
 """
 import sys
+import math
 import time
 import signal
 import threading
 from collections import deque
 
 import smbus2
-import numpy as np
 from RPLCD.i2c import CharLCD
 
 # ── I2C ──────────────────────────────────────────────────────────────
@@ -214,12 +214,16 @@ def absorbance(i0, i):
     """Beer-Lambert: A = log10(I0 / I)"""
     if i0 <= 0 or i <= 0:
         return float('nan')
-    return np.log10(i0 / i)
+    return math.log10(i0 / i)
+
+
+def average(values):
+    return sum(values) / len(values)
 
 
 # ── Baseline collection ───────────────────────────────────────────────
-def collect_baseline(sensor, n=150):
-    print(f"Collecting baseline ({n} samples) — keep sensor uncovered...")
+def collect_baseline(sensor, n=50):
+    print(f"Collecting baseline ({n} samples) — hold on white reference...")
     sensor.clear_fifo()
     vals = {k: [] for k in ('ir', 'red', 'green', 'blue')}
 
@@ -232,7 +236,7 @@ def collect_baseline(sensor, n=150):
                     vals[k].append(s[k])
         time.sleep(0.01)
 
-    baseline = {k: float(np.mean(vals[k])) for k in vals}
+    baseline = {k: average(vals[k]) for k in vals}
     print("  Baseline counts:")
     for k, v in baseline.items():
         print(f"    {k.upper():5s}: {v:,.0f}")
@@ -393,6 +397,7 @@ class LCDDisplay:
 
 # ── Main ──────────────────────────────────────────────────────────────
 N_SKIP = 4    # first concentration readings to discard while buffers fill
+BASELINE_PREP_S = 3    # seconds to place the white reference before baseline
 
 
 def _raise_keyboard_interrupt(signum, frame):
@@ -419,9 +424,14 @@ def main():
             adc_range=2,      # 16 µA full scale
         )
 
-        lcd.show_message("Collecting", "baseline...")
+        # Give time to place the white reference before the baseline
+        print("Place sensor on white reference...")
+        for s in range(BASELINE_PREP_S, 0, -1):
+            lcd.show_message("Place on white", f"reference... {s}")
+            time.sleep(1)
 
-        baseline = collect_baseline(sensor, n=150)
+        lcd.show_message("Hold still:", "baseline...")
+        baseline = collect_baseline(sensor, n=50)    # ~0.5 s at 100 sps
         sensor.clear_fifo()
 
         print("Calibration complete! Measurement in 5 seconds...\n")
@@ -452,7 +462,7 @@ def main():
                         buf[k].append(s[k])
 
             if len(buf['ir']) >= 10:
-                mean = {k: float(np.mean(buf[k])) for k in buf}
+                mean = {k: average(buf[k]) for k in buf}
                 abs_ = {k: absorbance(baseline[k], mean[k]) for k in mean}
                 
                 lcd.update(
