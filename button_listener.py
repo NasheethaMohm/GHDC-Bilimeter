@@ -68,6 +68,10 @@ class LCD:
             try:
                 # Measurement script may have changed the backlight
                 self.screen.backlight_enabled = True
+                # RPLCD skips characters it thinks are already on screen.
+                # The measurement script writes to the same LCD, so this
+                # cache is stale; clearing resets both screen and cache.
+                self.screen.clear()
                 # Line 1
                 padded1 = line1[:LCD_COLS].ljust(LCD_COLS)
                 self.screen.cursor_pos = (0, 0)

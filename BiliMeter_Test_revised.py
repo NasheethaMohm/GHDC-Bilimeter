@@ -425,15 +425,15 @@ def main():
         sensor.clear_fifo()
 
         print("Calibration complete! Measurement in 5 seconds...\n")
-        lcd.show_message("Place finger", "on sensor...")
+        lcd.show_message("Place sensor", "on skin...")
         time.sleep(5)
         # FIFO filled and stopped during the wait; drop those samples
-        # (taken before the finger was placed)
+        # (taken before the sensor was placed on skin)
         sensor.clear_fifo()
 
         lcd.start()
 
-        print("Place finger on sensor. Press Ctrl+C to stop.\n")
+        print("Place sensor on skin. Press Ctrl+C to stop.\n")
         print(f"{'IR':>10} {'RED':>10} {'GREEN':>10} {'BLUE':>10} "
               f"{'Abs_IR':>8} {'Abs_RED':>8} {'Abs_GRN':>8} {'Abs_BLU':>8}"
               f" {'Conc' :>10}")
